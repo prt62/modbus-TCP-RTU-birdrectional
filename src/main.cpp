@@ -101,43 +101,65 @@
 // LEDs + external watchdog supervisor (loop task, no SPI / UART access)
 // --------------------------------------------------------------------------
 
-static void handleLEDs() {
+static void handleLEDs()
+{
   static int8_t lastD3 = -1, lastD4 = -1;
   uint32_t traffic = g_lastTrafficMs;
   uint32_t now = millis();
   int d3, d4;
-  if (g_linkUp) {
-    d4 = HIGH;                                              // link: steady ON
-    d3 = (now - traffic < 80) ? HIGH : LOW;                 // Modbus activity flash
-  } else if (!g_ethOk) {
-    bool blink = (now % 400) < 200;                         // W5500 fault: ALTERNATING
+  if (g_linkUp)
+  {
+    d4 = HIGH;                              // link: steady ON
+    d3 = (now - traffic < 80) ? HIGH : LOW; // Modbus activity flash
+  }
+  else if (!g_ethOk)
+  {
+    bool blink = (now % 400) < 200; // W5500 fault: ALTERNATING
     d3 = blink ? HIGH : LOW;
     d4 = blink ? LOW : HIGH;
-  } else {
-    bool blink = (now % 400) < 200;                         // cable unplugged: both together
+  }
+  else
+  {
+    bool blink = (now % 400) < 200; // cable unplugged: both together
     d3 = d4 = blink ? HIGH : LOW;
   }
-  if (d3 != lastD3) { digitalWrite(LED_D3, d3); lastD3 = (int8_t)d3; }
-  if (d4 != lastD4) { digitalWrite(LED_D4, d4); lastD4 = (int8_t)d4; }
+  if (d3 != lastD3)
+  {
+    digitalWrite(LED_D3, d3);
+    lastD3 = (int8_t)d3;
+  }
+  if (d4 != lastD4)
+  {
+    digitalWrite(LED_D4, d4);
+    lastD4 = (int8_t)d4;
+  }
 }
 
-static void superviseExternalWatchdog() {
+static void superviseExternalWatchdog()
+{
   static uint32_t lastFeed = 0;
-  uint32_t hbNet = g_netHeartbeatMs;                        // read BEFORE millis()
+  uint32_t hbNet = g_netHeartbeatMs; // read BEFORE millis()
   uint32_t hbRtu = g_rtuHeartbeatMs;
   uint32_t now = millis();
-  if (now - hbNet > NET_HEARTBEAT_MAX_AGE_MS) return;       // NetTask hung: let ext. WDT reset us
+  if (now - hbNet > NET_HEARTBEAT_MAX_AGE_MS)
+    return; // NetTask hung: let ext. WDT reset us
   // A legitimate transaction (bus-free wait + TX + response timeout) must fit
   // inside this window, or a slow slave would look like a hung task (FIX-04).
-  if (now - hbRtu > NET_HEARTBEAT_MAX_AGE_MS + cfg.rtuTimeoutMs + 1000UL) return;
-  if (now - lastFeed >= EXT_WDT_FEED_MS) { lastFeed = now; pulseExternalWatchdog(); }
+  if (now - hbRtu > NET_HEARTBEAT_MAX_AGE_MS + cfg.rtuTimeoutMs + 1000UL)
+    return;
+  if (now - lastFeed >= EXT_WDT_FEED_MS)
+  {
+    lastFeed = now;
+    pulseExternalWatchdog();
+  }
 }
 
 // --------------------------------------------------------------------------
 // Setup / loop
 // --------------------------------------------------------------------------
 
-void setup() {
+void setup()
+{
   Serial.begin(115200);
 
   pinMode(LED_D3, OUTPUT);
@@ -150,7 +172,7 @@ void setup() {
 
 #if (RS485_DE_PIN >= 0) && !RS485_USE_HW_DE
   pinMode(RS485_DE_PIN, OUTPUT);
-  digitalWrite(RS485_DE_PIN, LOW);                          // receive by default
+  digitalWrite(RS485_DE_PIN, LOW); // receive by default
 #endif
 
   // ORDER IS LOAD-BEARING (audit FIX-01): the per-device default password is
@@ -159,7 +181,7 @@ void setup() {
   // persistence code runs. Nothing above this line may touch credentials.
   generateUniqueMac(mac);
 
-  configInit();                 // open NVS: every config / password access needs it
+  configInit(); // open NVS: every config / password access needs it
   factoryResetCheck();
   loadConfig();
   computeRtuTiming();
@@ -169,7 +191,7 @@ void setup() {
 
 #if W5500_RST >= 0
   pinMode(W5500_RST, OUTPUT);
-  digitalWrite(W5500_RST, W5500_RST_RELEASE_LEVEL);   // do NOT hold the chip in reset
+  digitalWrite(W5500_RST, W5500_RST_RELEASE_LEVEL); // do NOT hold the chip in reset
 #endif
   // SS = -1: the Ethernet library drives CS by hand, so the ESP32 must not also
   // route a hardware CS signal onto the same pin (audit FIX-58).
@@ -181,7 +203,7 @@ void setup() {
   modbusServer = CustomEthernetServer(cfg.port);
 
   pulseExternalWatchdog();
-  g_ethReady = ethernetInit();                              // retried by NetTask if it fails
+  g_ethReady = ethernetInit(); // retried by NetTask if it fails
   pulseExternalWatchdog();
 
   LOGF("\n=== Ajeevi Modbus Gateway v%s ===\n", FW_VERSION);
@@ -199,9 +221,14 @@ void setup() {
   // From here on ONLY NetTask touches the W5500. Same core as loop() and
   // same priority, so the Ethernet library's yield()-based busy waits
   // round-robin with loop() instead of starving it.
-  g_rtuJobQ  = xQueueCreate(1, sizeof(uint32_t));
+  g_rtuJobQ = xQueueCreate(1, sizeof(uint32_t));
   g_rtuDoneQ = xQueueCreate(1, sizeof(uint32_t));
-  if (!g_rtuJobQ || !g_rtuDoneQ) { LOGF("[SYS] queue alloc failed -> restart\n"); delay(100); esp_restart(); }
+  if (!g_rtuJobQ || !g_rtuDoneQ)
+  {
+    LOGF("[SYS] queue alloc failed -> restart\n");
+    delay(100);
+    esp_restart();
+  }
   g_ethOk = g_ethReady;
 
   // RtuTask owns ONLY the UART (never the W5500), so it can run on the other
@@ -215,7 +242,8 @@ void setup() {
   BaseType_t okNet = xTaskCreatePinnedToCore(netTask, "NetTask", NET_TASK_STACK, nullptr,
                                              uxTaskPriorityGet(nullptr), &g_netTask,
                                              xPortGetCoreID());
-  if (okRtu != pdPASS || okNet != pdPASS) {         // nothing works without both (audit FIX-17)
+  if (okRtu != pdPASS || okNet != pdPASS)
+  { // nothing works without both (audit FIX-17)
     LOGF("[SYS] task creation failed (rtu=%d net=%d) -> restart\n", (int)okRtu, (int)okNet);
     Serial.flush();
     delay(100);
@@ -223,7 +251,8 @@ void setup() {
   }
 }
 
-void loop() {
+void loop()
+{
   handleLEDs();
   superviseExternalWatchdog();
   vTaskDelay(pdMS_TO_TICKS(20));
