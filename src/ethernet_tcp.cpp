@@ -883,6 +883,9 @@ static void serviceModbusSessions() {
 #endif
       }
 
+      // The exception write above may have failed and closed this slot (len is
+      // already 0): subtracting aduLen would wrap and memmove ~64 kB.
+      if (!s.active) { closed = true; break; }
       s.len -= (uint16_t)aduLen;
       if (s.len) memmove(s.buf, s.buf + aduLen, s.len);
       s.frameStartMs = now;
