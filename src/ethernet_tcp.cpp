@@ -75,6 +75,9 @@ struct PendingReq {
 struct MbSession {
   EthernetClient sock;
   bool     active;
+  IPAddress peer;               // debug: who is connected (remoteIP() is gone after a close)
+  uint16_t peerPort;
+  uint32_t connectedMs;
   uint16_t len;                 // raw bytes held for reassembly
   uint32_t lastRxMs;
   uint32_t frameStartMs;
@@ -114,6 +117,42 @@ static void releaseSocket(EthernetClient& c) {
   }
   c = kNoClient;
 }
+
+// Debug: say WHY a Modbus TCP session is being closed (call before closeMbSession).
+static void logMbClose(MbSession& s, const char* why) {
+#if DEBUG_SERIAL
+  LOGF("[MB] slot %d (%u.%u.%u.%u:%u) closing: %s | open %lu s, W5500 socket state 0x%02X, busy=%d, queued=%u, held bytes=%u\n",
+       (int)(&s - g_mb), s.peer[0], s.peer[1], s.peer[2], s.peer[3], s.peerPort, why,
+       (unsigned long)((millis() - s.connectedMs) / 1000UL), s.sock.status(),
+       (int)s.busy, (unsigned)s.qCount, (unsigned)s.len);
+#else
+  (void)s; (void)why;
+#endif
+}
+
+#if DEBUG_SERIAL
+// Debug: one line whenever a meter (unit id) changes between answering / silent.
+static uint8_t g_dbgUnitState[256];   // 0 = unknown, 1 = online, 2 = offline
+static uint8_t g_dbgUnitFails[256];   // consecutive failed requests (saturates at 255)
+static void dbgUnitResult(uint8_t unit, bool ok) {
+  uint8_t& st = g_dbgUnitState[unit];
+  uint8_t& fl = g_dbgUnitFails[unit];
+  if (ok) {
+    if (st == 2)      LOGF("[METER] *** unit %u is ONLINE again (after %u failed requests)\n", unit, fl);
+    else if (st == 0) LOGF("[METER] *** unit %u is ONLINE - first valid reply received\n", unit);
+    st = 1; fl = 0;
+  } else {
+    if (fl < 255) fl++;
+    if (st == 1)      LOGF("[METER] *** unit %u went OFFLINE - no valid reply\n", unit);
+    else if (st == 0) LOGF("[METER] *** unit %u NOT responding - first request failed\n", unit);
+    else if (fl == 3 || fl % 20 == 0)
+                      LOGF("[METER] unit %u still offline (%u failed requests in a row)\n", unit, fl);
+    st = 2;
+  }
+}
+#else
+#define dbgUnitResult(u, ok) do {} while (0)
+#endif
 
 static void closeMbSession(MbSession& s) {
   releaseSocket(s.sock);
@@ -444,14 +483,22 @@ static void acceptModbusClients() {
     s.lastRxMs = millis();
     s.frameStartMs = s.lastRxMs;
     g_stat.tcpAccepted++;
-    LOGF("[MB] client on socket %u -> slot %d\n", nc.getSocketNumber(), slot);
+    s.peer = s.sock.remoteIP(); s.peerPort = s.sock.remotePort(); s.connectedMs = s.lastRxMs;
+    LOGF("[MB] client %u.%u.%u.%u:%u CONNECTED on W5500 socket %u -> slot %d (%u active)\n",
+         s.peer[0], s.peer[1], s.peer[2], s.peer[3], s.peerPort,
+         s.sock.getSocketNumber(), slot, (unsigned)activeModbusClients());
   }
 }
 
 static void sendModbusException(MbSession& s, uint8_t tidHi, uint8_t tidLo, uint8_t unit,
                                 uint8_t fc, uint8_t code) {
   uint8_t r[9] = { tidHi, tidLo, 0, 0, 0, 3, unit, (uint8_t)(fc | 0x80), code };
-  if (!writeAll(s.sock, r, sizeof(r))) { closeMbSession(s); g_stat.tcpDropped++; }
+  LOGF("[MB] slot %d <- sending exception 0x%02X to master (tid %02X%02X unit %u fc %u)\n",
+       (int)(&s - g_mb), code, tidHi, tidLo, unit, fc);
+  if (!writeAll(s.sock, r, sizeof(r))) {
+    logMbClose(s, "write of exception reply failed (master gone / TCP stalled)");
+    closeMbSession(s); g_stat.tcpDropped++;
+  }
 }
 
 // Function-code audit table (audit FIX-07 / FIX-20). "req" is unit+fc+data, no
@@ -585,6 +632,10 @@ static void dispatchRtuJob() {
     memcpy(g_job.req, r.rtu, r.rtuLen);
     g_job.slot   = (int8_t)i;
     g_job.gen    = s.gen;
+#if DEBUG_TRAFFIC
+    LOGF("[RTU] job %lu start: unit %u fc %u for slot %d (waited %lu ms in queue)\n",
+         (unsigned long)g_job.jobId, r.unit, r.fc, i, (unsigned long)(millis() - r.enqueuedMs));
+#endif
 
     s.qHead = (uint8_t)((s.qHead + 1) % REQ_QUEUE_DEPTH);
     s.qCount--;
@@ -685,6 +736,8 @@ static void completeRtuJob() {
   MbSession& s = g_mb[j.slot];
   const bool alive = s.active && s.gen == j.gen;    // client may have gone meanwhile
   if (alive) s.busy = false;
+  else LOGF("[MB] master of unit %u fc %u disconnected before the RTU answer came back (result %d) - nothing to send\n",
+            j.unit, j.fc, (int)j.result);
 
   uint8_t exception = 0;
   switch (j.result) {
@@ -694,12 +747,19 @@ static void completeRtuJob() {
       if (!alive) break;
       static uint8_t tx[MB_TCP_ADU_MAX + 2];
       size_t pduLen = j.rxLen - 2;                  // unit + fc + data
+#if DEBUG_TRAFFIC
+      LOGF("[MB] slot %d <- reply to master: tid %02X%02X unit %u fc %u, %u B\n",
+           j.slot, j.tidHi, j.tidLo, j.unit, j.fc, (unsigned)(pduLen + 6));
+#endif
       tx[0] = j.tidHi; tx[1] = j.tidLo;             // transaction id, exactly as received
       tx[2] = 0;       tx[3] = 0;                   // protocol id
       tx[4] = (uint8_t)(pduLen >> 8);
       tx[5] = (uint8_t)(pduLen & 0xFF);
       memcpy(&tx[6], j.rx, pduLen);
-      if (!writeAll(s.sock, tx, pduLen + 6)) { closeMbSession(s); g_stat.tcpDropped++; }
+      if (!writeAll(s.sock, tx, pduLen + 6)) {
+        logMbClose(s, "write of reply failed (master gone / TCP stalled)");
+        closeMbSession(s); g_stat.tcpDropped++;
+      }
       break;
     }
     case RTU_BROADCAST:
@@ -708,7 +768,7 @@ static void completeRtuJob() {
     case RTU_TIMEOUT:
       unitStatRecord(j.unit, false);
       g_stat.rtuTimeout++;
-      LOGF("[RTU] timeout unit %u fc %u\n", j.unit, j.fc);
+      LOGF("[RTU] timeout unit %u fc %u (no byte from meter within %u ms)\n", j.unit, j.fc, cfg.rtuTimeoutMs);
       exception = 0x0B;
       break;
     case RTU_CRC:
@@ -737,6 +797,9 @@ static void completeRtuJob() {
       exception = 0x0A;
       break;
   }
+  if (j.result != RTU_BROADCAST) dbgUnitResult(j.unit, j.result == RTU_OK);
+  if (exception && alive && !(cfg.flags & CFG_FLAG_TCP_EXCEPTION))
+    LOGF("[MB] exception 0x%02X NOT sent (TCP-exception switch is OFF) -> master will hit ITS OWN timeout\n", exception);
   // MOXA's "Modbus TCP Exception" switch: some masters prefer no answer at all
   // and their own timeout, and treat an exception as a device fault (FIX-A12).
   if (exception && alive && (cfg.flags & CFG_FLAG_TCP_EXCEPTION))
@@ -751,7 +814,10 @@ static void serviceModbusSessions() {
     MbSession& s = g_mb[i];
     if (!s.active) continue;
 
-    if (!s.sock.connected()) { closeMbSession(s); g_stat.tcpDisconnects++; continue; }
+    if (!s.sock.connected()) {
+      logMbClose(s, "master disconnected (TCP closed / reset / cable pulled)");
+      closeMbSession(s); g_stat.tcpDisconnects++; continue;
+    }
 
     uint32_t now = millis();
     int avail = s.sock.available();
@@ -773,7 +839,9 @@ static void serviceModbusSessions() {
       uint16_t protocolId  = ((uint16_t)s.buf[2] << 8) | s.buf[3];
       uint16_t declaredLen = ((uint16_t)s.buf[4] << 8) | s.buf[5];
       if (protocolId != 0 || declaredLen < 2 || declaredLen > 254) {
-        LOGF("[MB] bad MBAP header -> closing client\n");
+        LOGF("[MB] bad MBAP header (protocol id 0x%04X, length %u): %02X %02X %02X %02X %02X %02X %02X\n",
+             protocolId, declaredLen, s.buf[0], s.buf[1], s.buf[2], s.buf[3], s.buf[4], s.buf[5], s.buf[6]);
+        logMbClose(s, "not Modbus TCP traffic / stream out of sync");
         closeMbSession(s); g_stat.tcpDropped++;
         closed = true;
         break;
@@ -804,6 +872,15 @@ static void serviceModbusSessions() {
         memcpy(r.rtu, s.buf + 6, declaredLen);
         r.enqueuedMs = now;
         s.qCount++;
+#if DEBUG_TRAFFIC
+        if (declaredLen >= 6)
+          LOGF("[MB] slot %d -> request from master: tid %02X%02X unit %u fc %u addr %u val/qty %u (queued %u)\n",
+               i, tidHi, tidLo, unit, fc, ((unsigned)s.buf[8] << 8) | s.buf[9],
+               ((unsigned)s.buf[10] << 8) | s.buf[11], (unsigned)s.qCount);
+        else
+          LOGF("[MB] slot %d -> request from master: tid %02X%02X unit %u fc %u (queued %u)\n",
+               i, tidHi, tidLo, unit, fc, (unsigned)s.qCount);
+#endif
       }
 
       s.len -= (uint16_t)aduLen;
@@ -816,13 +893,13 @@ static void serviceModbusSessions() {
     // An incomplete ADU must not sit forever; a complete one waiting for the
     // bus, or bytes held back by a full ring, are not "incomplete".
     if (!blockedByQueue && s.len > 0 && now - s.frameStartMs > TCP_PARTIAL_FRAME_TIMEOUT_MS) {
-      LOGF("[MB] incomplete frame timeout -> closing client\n");
+      logMbClose(s, "incomplete Modbus frame - master stopped sending mid-request");
       closeMbSession(s); g_stat.tcpDropped++;
       continue;
     }
 #if CLIENT_IDLE_TIMEOUT_MS > 0
     if (!s.busy && s.qCount == 0 && s.len == 0 && now - s.lastRxMs > CLIENT_IDLE_TIMEOUT_MS) {
-      LOGF("[MB] idle timeout -> closing client\n");
+      logMbClose(s, "idle timeout - master sent nothing for a long time");
       closeMbSession(s);
     }
 #endif
@@ -918,6 +995,9 @@ void netTask(void* arg) {
   if (!g_twdtSubscribed) LOGF("[WDT] task WDT unavailable (%d) - relying on external WDT\n", (int)e);
 
   uint32_t lastLink = 0, lastHealth = millis();
+#if DEBUG_SERIAL && (DEBUG_STATUS_MS > 0)
+  uint32_t lastStatus = millis();
+#endif
   for (;;) {
     netAlive();
     uint32_t now = millis();
@@ -932,8 +1012,23 @@ void netTask(void* arg) {
 
     if (now - lastLink >= LINK_POLL_MS) {
       lastLink = now;
-      g_linkUp = g_ethReady && (Ethernet.linkStatus() == LinkON);
+      const bool up = g_ethReady && (Ethernet.linkStatus() == LinkON);
+      if (up != g_linkUp)
+        LOGF("[ETH] link %s\n", up ? "UP (cable connected)" : "DOWN (cable / switch / PHY problem)");
+      g_linkUp = up;
     }
+#if DEBUG_SERIAL && (DEBUG_STATUS_MS > 0)
+    if (now - lastStatus >= DEBUG_STATUS_MS) {
+      lastStatus = now;
+      LOGF("[STAT] link=%s clients=%u queued=%u | req=%lu ok=%lu timeout=%lu crc=%lu frame=%lu | tcp accepted=%lu disc=%lu dropped=%lu | uart fe=%lu pe=%lu ovf=%lu\n",
+           g_linkUp ? "UP" : "DOWN", (unsigned)activeModbusClients(), (unsigned)queuedRequests(),
+           (unsigned long)g_stat.requests, (unsigned long)g_stat.rtuOk, (unsigned long)g_stat.rtuTimeout,
+           (unsigned long)g_stat.rtuCrc, (unsigned long)g_stat.rtuFrame,
+           (unsigned long)g_stat.tcpAccepted, (unsigned long)g_stat.tcpDisconnects,
+           (unsigned long)g_stat.tcpDropped,
+           (unsigned long)g_uartFrameErr, (unsigned long)g_uartParityErr, (unsigned long)g_uartOverflow);
+    }
+#endif
     if (now - lastHealth >= HEALTH_CHECK_MS) {
       lastHealth = now;
       // Three consecutive bad reads before acting: one glitched SPI transfer

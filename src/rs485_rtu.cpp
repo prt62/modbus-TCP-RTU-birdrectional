@@ -70,6 +70,42 @@ static void rs485ErrorCb(hardwareSerial_error_t err) {
   }
 }
 
+#if DEBUG_SERIAL
+static void logHex(const char* tag, const uint8_t* d, size_t n) {
+  const size_t kMax = 48;
+  LOGF("[RTU]   %s (%u B):", tag, (unsigned)n);
+  for (size_t i = 0; i < n && i < kMax; i++) LOGF(" %02X", d[i]);
+  if (n > kMax) LOGF(" ...");
+  LOGF("\n");
+}
+static const char* rtuResultName(RtuResult r) {
+  switch (r) {
+    case RTU_OK:            return "OK";
+    case RTU_BROADCAST:     return "BROADCAST";
+    case RTU_TIMEOUT:       return "TIMEOUT";
+    case RTU_CRC:           return "CRC_ERROR";
+    case RTU_FRAME_ERROR:   return "FRAME_ERROR";
+    case RTU_UNIT_MISMATCH: return "UNIT_MISMATCH";
+    case RTU_FC_MISMATCH:   return "FC_MISMATCH";
+  }
+  return "?";
+}
+static const char* modbusExceptionName(uint8_t c) {
+  switch (c) {
+    case 0x01: return "illegal function";
+    case 0x02: return "illegal data address (register not in meter)";
+    case 0x03: return "illegal data value (e.g. quantity too big)";
+    case 0x04: return "slave device failure";
+    case 0x05: return "acknowledge";
+    case 0x06: return "slave busy";
+    case 0x08: return "memory parity error";
+    case 0x0A: return "gateway path unavailable";
+    case 0x0B: return "gateway target failed to respond";
+  }
+  return "other";
+}
+#endif
+
 void rs485Init() {
   if (!rs485.setRxBufferSize(RS485_RX_BUFFER)) LOGF("[RTU] RX buffer alloc failed\n");
   rs485.begin(cfg.baud, SERIAL_FMTS[cfg.fmt].conf, RXD2, TXD2);
@@ -85,6 +121,13 @@ void rs485Init() {
   if (!rs485.setRxFIFOFull(fifoThreshold)) LOGF("[RTU] setRxFIFOFull failed\n");
   if (!rs485.setRxTimeout(2))              LOGF("[RTU] setRxTimeout failed\n");
   rs485.onReceiveError(rs485ErrorCb);
+#if RS485_DE_PIN >= 0
+  LOGF("[RTU] UART2 RX=GPIO%d TX=GPIO%d, DE/RE=GPIO%d (%s direction control)\n",
+       RXD2, TXD2, RS485_DE_PIN, RS485_USE_HW_DE ? "hardware" : "firmware");
+#else
+  LOGF("[RTU] UART2 RX=GPIO%d TX=GPIO%d, no DE pin (transceiver must switch direction by itself)\n",
+       RXD2, TXD2);
+#endif
 }
 
 // Read and discard everything on the line until it has been silent for t3.5
@@ -181,6 +224,9 @@ RtuResult rtuTransaction(const uint8_t* req, size_t reqLen, uint8_t* rx, size_t&
   frame[reqLen + 1] = (uint8_t)(crc >> 8);
   const size_t frameLen = reqLen + 2;
   const bool broadcast = (req[0] == 0);
+#if DEBUG_SERIAL
+  const uint32_t dbgFe0 = g_uartFrameErr, dbgPe0 = g_uartParityErr, dbgOv0 = g_uartOverflow;
+#endif
 
   if (g_rtuResyncNeeded) {                        // recover from an abandoned job
     g_rtuResyncNeeded = false;
@@ -305,5 +351,54 @@ RtuResult rtuTransaction(const uint8_t* req, size_t reqLen, uint8_t* rx, size_t&
   // proven by t3.5 of silence, waiting it again just wastes bus time - at 1200
   // baud that was 32 ms on every single poll (audit FIX-A03).
   g_busFreeAtUs = micros() + (silenceObserved ? 0 : g_t35Us);
+
+#if DEBUG_SERIAL
+  // Logged AFTER the transaction, so printing never disturbs RS-485 timing.
+  {
+    const uint32_t dFe = g_uartFrameErr - dbgFe0, dPe = g_uartParityErr - dbgPe0,
+                   dOv = g_uartOverflow - dbgOv0;
+    if (result != RTU_OK) {
+      LOGF("[RTU] FAIL unit %u fc %u -> %s (waited %lu ms of %u ms, %lu baud)\n",
+           req[0], req[1], rtuResultName(result), (unsigned long)(millis() - start),
+           cfg.rtuTimeoutMs, (unsigned long)cfg.baud);
+      logHex("TX sent    ", frame, frameLen);
+      logHex("RX received", rx, rxLen);
+      LOGF("[RTU]   UART errors during this request: framing +%lu, parity +%lu, overflow +%lu\n",
+           (unsigned long)dFe, (unsigned long)dPe, (unsigned long)dOv);
+      switch (result) {
+        case RTU_TIMEOUT:
+          if (dFe || dPe)
+            LOGF("[RTU]   reason: line is active but bytes are garbled -> baud rate / parity / stop bits mismatch\n");
+          else
+            LOGF("[RTU]   reason: ZERO bytes came back -> check A/B swap, GND, slave power, slave address (unit %u), baud/parity, DE pin, timeout too short\n", req[0]);
+          break;
+        case RTU_CRC:
+          LOGF("[RTU]   reason: full frame received but CRC wrong -> baud/parity mismatch, noise, missing termination\n");
+          break;
+        case RTU_FRAME_ERROR:
+          LOGF("[RTU]   reason: bad frame (got %u bytes, expected %d, overflow=%d, extra bytes=%d, gap>t1.5=%d) -> noise, two devices answering, or wrong length\n",
+               (unsigned)rxLen, expected, (int)overflow, (int)extraByte, (int)gapViolation);
+          break;
+        case RTU_UNIT_MISMATCH:
+          LOGF("[RTU]   reason: unit %u answered but %u was asked -> duplicate address or wrong unit id\n", rx[0], req[0]);
+          break;
+        case RTU_FC_MISMATCH:
+          LOGF("[RTU]   reason: answer carries function code %u, request was %u\n", rx[1] & 0x7F, req[1]);
+          break;
+        default: break;
+      }
+    } else {
+      if (rx[1] & 0x80)
+        LOGF("[RTU] unit %u fc %u -> meter answered with EXCEPTION 0x%02X (%s) - meter is alive, request is the problem\n",
+             req[0], req[1], rx[2], modbusExceptionName(rx[2]));
+#if DEBUG_TRAFFIC
+      LOGF("[RTU] OK unit %u fc %u, %u B reply, turnaround %lu us\n",
+           req[0], req[1], (unsigned)rxLen, (unsigned long)g_turnaroundLastUs);
+      logHex("TX sent    ", frame, frameLen);
+      logHex("RX received", rx, rxLen);
+#endif
+    }
+  }
+#endif
   return result;
 }

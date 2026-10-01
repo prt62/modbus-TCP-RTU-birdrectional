@@ -15,6 +15,15 @@
 #ifndef DEBUG_SERIAL
 #define DEBUG_SERIAL 1
 #endif
+// Extra-detailed traffic log (every request / reply / RTU frame in hex).
+// 0 = only state changes and errors are printed. Needs DEBUG_SERIAL=1.
+#ifndef DEBUG_TRAFFIC
+#define DEBUG_TRAFFIC 1
+#endif
+// Periodic one-line status summary on the serial port, in ms (0 = off).
+#ifndef DEBUG_STATUS_MS
+#define DEBUG_STATUS_MS 10000UL
+#endif
 
 // ---- W5500 Ethernet (SPI) ----
 #define W5500_MOSI 23
