@@ -327,7 +327,7 @@ void loadConfig() {
 // --------------------------------------------------------------------------
 
 void factoryResetCheck() {
-#if FACTORY_RESET_PIN >= 0
+#if FACTORY_RESET_PIN >= 0                          
   pinMode(FACTORY_RESET_PIN, INPUT_PULLUP);
   delay(10);
   if (digitalRead(FACTORY_RESET_PIN) != LOW) return;
